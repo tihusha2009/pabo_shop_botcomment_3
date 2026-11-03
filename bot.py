@@ -3,6 +3,7 @@ import re
 import random
 import sqlite3
 import logging
+from datetime import datetime, timedelta
 from telegram import Update, MessageOriginChannel
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -32,6 +33,7 @@ CANCEL_USERS = {
 RANDOM_WORDS = {"рд", "рандом", "рандомный"}
 
 LOTTERY_PATTERN = r"#(?:беспроигрышная|мини_лот|мини_бп|лот)_(\d+)"
+AUCTION_PATTERN = r"#аукцион[_\s]*(\d+)"
 
 # =====================================================
 # DATABASE
@@ -65,19 +67,9 @@ def init_db():
                 discussion_chat_id INTEGER NOT NULL,
                 thread_id INTEGER NOT NULL,
                 list_message_id INTEGER,
-                ticket_price INTEGER DEFAULT 0,
-                lottery_hashtag TEXT DEFAULT ''
+                PRIMARY KEY (channel_id, post_id)
             )
         """)
-        try:
-            DB.execute("ALTER TABLE lots ADD COLUMN ticket_price INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            DB.execute("ALTER TABLE lots ADD COLUMN lottery_hashtag TEXT DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
-
         DB.execute("""
             CREATE TABLE IF NOT EXISTS lot_tickets (
                 channel_id INTEGER NOT NULL,
@@ -85,15 +77,9 @@ def init_db():
                 number INTEGER NOT NULL,
                 owner_user_id INTEGER,
                 owner_label TEXT,
-                is_mini INTEGER DEFAULT 0,
                 PRIMARY KEY (channel_id, post_id, number)
             )
         """)
-        try:
-            DB.execute("ALTER TABLE lot_tickets ADD COLUMN is_mini INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-
         DB.execute("""
             CREATE TABLE IF NOT EXISTS discussion_posts (
                 discussion_chat_id INTEGER NOT NULL,
@@ -103,7 +89,27 @@ def init_db():
                 PRIMARY KEY (discussion_chat_id, thread_id)
             )
         """)
-        
+        # Таблица аукционов
+        DB.execute("""
+            CREATE TABLE IF NOT EXISTS auctions (
+                channel_id INTEGER NOT NULL,
+                post_id INTEGER NOT NULL,
+                auction_number INTEGER NOT NULL,
+                base_caption TEXT NOT NULL,
+                start_price INTEGER NOT NULL,
+                min_step INTEGER NOT NULL,
+                duration_minutes INTEGER NOT NULL,
+                end_time TEXT,
+                current_bid INTEGER,
+                current_bidder_id INTEGER,
+                current_bidder_label TEXT,
+                is_active INTEGER DEFAULT 1,
+                discussion_chat_id INTEGER,
+                thread_id INTEGER,
+                PRIMARY KEY (channel_id, post_id)
+            )
+        """)
+        # Таблица известных пользователей
         DB.execute("""
             CREATE TABLE IF NOT EXISTS known_users (
                 user_id INTEGER PRIMARY KEY,
@@ -112,31 +118,18 @@ def init_db():
             )
         """)
 
-def save_user(user):
-    """Сохраняет информацию о пользователе в БД."""
-    if not user:
-        return
-    username = user.username.lower() if user.username else None
-    full_name = user.full_name
-    with DB:
-        DB.execute("""
-            INSERT INTO known_users (user_id, username, full_name)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = COALESCE(excluded.username, known_users.username),
-                full_name = COALESCE(excluded.full_name, known_users.full_name)
-        """, (user.id, username, full_name))
-
-def find_user_by_username(username):
-    """Ищет пользователя по username в БД."""
-    if not username:
-        return None
-    username = username.lower().lstrip('@')
-    row = DB.execute("""
-        SELECT user_id, username, full_name FROM known_users
-        WHERE LOWER(username) = ?
-    """, (username,)).fetchone()
-    return row
+    # Миграции: добавляем недостающие колонки для старых БД
+    migrations = [
+        "ALTER TABLE lots ADD COLUMN ticket_price INTEGER DEFAULT 0",
+        "ALTER TABLE lots ADD COLUMN lottery_hashtag TEXT DEFAULT ''",
+        "ALTER TABLE lot_tickets ADD COLUMN is_mini INTEGER DEFAULT 0",
+    ]
+    for sql in migrations:
+        try:
+            with DB:
+                DB.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # Колонка уже существует
 
 # =====================================================
 # COMMON HELPERS
@@ -157,6 +150,32 @@ def is_free_label(label):
         or "свободно" in value
         or value == "free"
     )
+
+def save_user(user):
+    """Сохраняет информацию о пользователе в БД."""
+    if not user:
+        return
+    username = user.username.lower() if user.username else None
+    full_name = user.full_name
+    with DB:
+        DB.execute("""
+            INSERT INTO known_users (user_id, username, full_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = COALESCE(excluded.username, known_users.username),
+                full_name = COALESCE(excluded.full_name, known_users.full_name)
+        """, (user.id, username, full_name))
+
+def find_user_by_username(username):
+    """Ищет пользователя по username в БД."""
+    if not username:
+        return None
+    username_clean = username.lower().lstrip('@')
+    row = DB.execute("""
+        SELECT user_id, username, full_name FROM known_users
+        WHERE LOWER(username) = ?
+    """, (username_clean,)).fetchone()
+    return row
 
 def parse_ticket_price(text):
     if not text:
@@ -412,8 +431,7 @@ def find_lottery(text):
 
 def lottery_list(channel_id, post_id, lot_number):
     rows = DB.execute("""
-        SELECT number, owner_label, is_mini
-        FROM lot_tickets
+        SELECT number, owner_label, is_mini FROM lot_tickets
         WHERE channel_id = ? AND post_id = ?
         ORDER BY number
     """, (channel_id, post_id)).fetchall()
@@ -445,7 +463,6 @@ async def create_lottery(message, origin):
         return
 
     ticket_price = parse_ticket_price(text)
-    
     hashtag_match = re.search(LOTTERY_PATTERN, text, re.IGNORECASE)
     lottery_hashtag = hashtag_match.group(0) if hashtag_match else f"#лот_{lot_number}"
 
@@ -453,11 +470,13 @@ async def create_lottery(message, origin):
         DB.execute("""
             INSERT INTO lots (
                 channel_id, post_id, lot_number, ticket_count,
-                discussion_chat_id, thread_id, list_message_id, ticket_price, lottery_hashtag
+                discussion_chat_id, thread_id, list_message_id,
+                ticket_price, lottery_hashtag
             ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
         """, (
             channel_id, post_id, lot_number, count,
-            message.chat.id, message.message_id, ticket_price, lottery_hashtag,
+            message.chat.id, message.message_id,
+            ticket_price, lottery_hashtag,
         ))
         DB.executemany("""
             INSERT INTO lot_tickets (
@@ -465,7 +484,8 @@ async def create_lottery(message, origin):
             ) VALUES (?, ?, ?, NULL, NULL, 0)
         """, [(channel_id, post_id, n) for n in range(1, count + 1)])
 
-    logger.info("Лотерея #%s создана: номерков=%s, цена=%s, хэштег=%s", lot_number, count, ticket_price, lottery_hashtag)
+    logger.info("Лотерея #%s создана: номерков=%s, цена=%s, хэштег=%s",
+                lot_number, count, ticket_price, lottery_hashtag)
 
     try:
         sent = await message.reply_text(lottery_list(channel_id, post_id, lot_number))
@@ -500,12 +520,14 @@ async def handle_root_post(update, context):
 
     get_or_create_shop(channel_id, post_id, get_caption(message))
     await create_lottery(message, origin)
+    await create_auction(message, origin, context)
 
 def find_lottery_for_message(message):
     thread_id = message.message_thread_id
     if thread_id:
         result = DB.execute("""
-            SELECT channel_id, post_id, lot_number, ticket_count, list_message_id, ticket_price, lottery_hashtag
+            SELECT channel_id, post_id, lot_number, ticket_count,
+                   list_message_id, ticket_price, lottery_hashtag
             FROM lots WHERE discussion_chat_id = ? AND thread_id = ?
         """, (message.chat.id, thread_id)).fetchone()
         if result:
@@ -517,11 +539,13 @@ def find_lottery_for_message(message):
             origin = reply.forward_origin
             if isinstance(origin, MessageOriginChannel):
                 return DB.execute("""
-                    SELECT channel_id, post_id, lot_number, ticket_count, list_message_id, ticket_price, lottery_hashtag
+                    SELECT channel_id, post_id, lot_number, ticket_count,
+                           list_message_id, ticket_price, lottery_hashtag
                     FROM lots WHERE channel_id = ? AND post_id = ?
                 """, (origin.chat.id, origin.message_id)).fetchone()
         return DB.execute("""
-            SELECT channel_id, post_id, lot_number, ticket_count, list_message_id, ticket_price, lottery_hashtag
+            SELECT channel_id, post_id, lot_number, ticket_count,
+                   list_message_id, ticket_price, lottery_hashtag
             FROM lots WHERE discussion_chat_id = ? AND list_message_id = ?
         """, (message.chat.id, reply.message_id)).fetchone()
     return None
@@ -541,7 +565,8 @@ def parse_lottery_request(text):
     numbers = list(dict.fromkeys(int(v) for v in re.findall(r"\d+", lowered)))
     return numbers, random_count
 
-async def refresh_lottery_list(context, chat_id, list_message_id, channel_id, post_id, lot_number):
+async def refresh_lottery_list(context, chat_id, list_message_id,
+                               channel_id, post_id, lot_number):
     if not list_message_id:
         return
     try:
@@ -652,10 +677,330 @@ async def handle_lottery_comment(update, context):
     return True
 
 # =====================================================
+# AUCTION FUNCTIONS
+# =====================================================
+def parse_auction_data(text):
+    if not text:
+        return None
+
+    auction_match = re.search(AUCTION_PATTERN, text, re.IGNORECASE)
+    if not auction_match:
+        return None
+
+    auction_number = int(auction_match.group(1))
+
+    start_match = re.search(
+        r"(?:начальная\s*(?:цена|ставка)|старт)[:\s]*(\d+)\s*₽?",
+        text, re.IGNORECASE,
+    )
+    step_match = re.search(
+        r"(?:минимальный\s*(?:шаг|шаг\s+аукциона)|минимальная\s*сумма|шаг)[:\s]*(\d+)\s*₽?",
+        text, re.IGNORECASE,
+    )
+    duration_match = re.search(
+        r"(?:продолжительность|время|длительность)[^\d]*(\d+)\s*(?:минут|мин|ч|часа|час)?",
+        text, re.IGNORECASE,
+    )
+
+    if not start_match:
+        logger.warning("Аукцион #%s: Не найдена начальная цена", auction_number)
+        return None
+    if not step_match:
+        logger.warning("Аукцион #%s: Не найден минимальный шаг", auction_number)
+        return None
+    if not duration_match:
+        logger.warning("Аукцион #%s: Не найдена продолжительность", auction_number)
+        return None
+
+    duration_val = float(duration_match.group(1))
+    start_pos = duration_match.start()
+    end_pos = duration_match.end()
+    context_snippet = text[max(0, start_pos - 10):min(len(text), end_pos + 10)].lower()
+
+    if 'ч' in context_snippet and 'мин' not in context_snippet:
+        duration_minutes = int(duration_val * 60)
+    else:
+        duration_minutes = int(duration_val)
+
+    return {
+        'auction_number': auction_number,
+        'start_price': int(start_match.group(1)),
+        'min_step': int(step_match.group(1)),
+        'duration_minutes': duration_minutes,
+    }
+
+def render_auction_caption(channel_id, post_id):
+    row = DB.execute("""
+        SELECT base_caption, current_bid, current_bidder_label, is_active
+        FROM auctions WHERE channel_id = ? AND post_id = ?
+    """, (channel_id, post_id)).fetchone()
+
+    if not row:
+        return None
+
+    base_caption, current_bid, current_bidder_label, is_active = row
+
+    lines = base_caption.split('\n')
+    filtered_lines = []
+    skip_next = False
+
+    for i, line in enumerate(lines):
+        if skip_next:
+            skip_next = False
+            continue
+        if re.match(r"^\s*(Последняя ставка|Победитель|Аукцион завершен)\s*:?\s*$", line):
+            skip_next = True
+            continue
+        filtered_lines.append(line)
+
+    base_text = '\n'.join(filtered_lines).rstrip()
+
+    if is_active:
+        if current_bid and current_bidder_label:
+            block = f"\n\nПоследняя ставка:\n{current_bidder_label} — {current_bid}₽"
+        else:
+            block = ""
+    else:
+        if current_bid and current_bidder_label:
+            block = f"\n\nПобедитель:\n{current_bidder_label} — {current_bid}₽"
+        else:
+            block = "\n\nАукцион завершен без ставок"
+
+    return base_text + block
+
+async def update_auction_post(context, channel_id, post_id):
+    text = render_auction_caption(channel_id, post_id)
+    if text is None:
+        return
+
+    try:
+        await context.bot.edit_message_text(chat_id=channel_id, message_id=post_id, text=text)
+        return
+    except TelegramError:
+        pass
+
+    try:
+        await context.bot.edit_message_caption(chat_id=channel_id, message_id=post_id, caption=text)
+    except TelegramError as e:
+        logger.exception("Не удалось обновить пост аукциона %s: %s", post_id, e)
+
+async def create_auction(message, origin, context):
+    text = get_caption(message)
+    parsed = parse_auction_data(text)
+    if not parsed:
+        return False
+
+    channel_id = origin.chat.id
+    post_id = origin.message_id
+
+    exists = DB.execute("""
+        SELECT 1 FROM auctions WHERE channel_id = ? AND post_id = ?
+    """, (channel_id, post_id)).fetchone()
+    if exists:
+        return False
+
+    end_time = datetime.now() + timedelta(minutes=parsed['duration_minutes'])
+
+    with DB:
+        DB.execute("""
+            INSERT INTO auctions (
+                channel_id, post_id, auction_number, base_caption,
+                start_price, min_step, duration_minutes, end_time,
+                current_bid, current_bidder_id, current_bidder_label,
+                is_active, discussion_chat_id, thread_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 1, ?, ?)
+        """, (
+            channel_id, post_id, parsed['auction_number'], text,
+            parsed['start_price'], parsed['min_step'], parsed['duration_minutes'],
+            end_time.isoformat(), message.chat.id, message.message_id,
+        ))
+
+    logger.info("Аукцион #%s создан", parsed['auction_number'])
+    await update_auction_post(context, channel_id, post_id)
+    return True
+
+def find_auction_for_message(message):
+    thread_id = message.message_thread_id
+    if thread_id:
+        row = DB.execute("""
+            SELECT channel_id, post_id, start_price, min_step,
+                   end_time, current_bid, current_bidder_label, is_active
+            FROM auctions WHERE discussion_chat_id = ? AND thread_id = ?
+        """, (message.chat.id, thread_id)).fetchone()
+        if row:
+            return row
+
+    reply = message.reply_to_message
+    if reply and reply.is_automatic_forward:
+        origin = reply.forward_origin
+        if isinstance(origin, MessageOriginChannel):
+            row = DB.execute("""
+                SELECT channel_id, post_id, start_price, min_step,
+                       end_time, current_bid, current_bidder_label, is_active
+                FROM auctions WHERE channel_id = ? AND post_id = ?
+            """, (origin.chat.id, origin.message_id)).fetchone()
+            if row:
+                return row
+
+    return None
+
+def parse_bid(text):
+    if not text:
+        return None
+    match = re.search(r"(\d+)\s*₽?", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+async def handle_auction_comment(update, context):
+    message = update.effective_message
+    if not message or not message.text or not message.from_user:
+        return False
+
+    auction = find_auction_for_message(message)
+    if not auction:
+        return False
+
+    (channel_id, post_id, start_price, min_step,
+     end_time_str, current_bid, current_bidder_label, is_active) = auction
+
+    user = message.from_user
+    label = user_label(user)
+    bid = parse_bid(message.text.strip())
+
+    if bid is None:
+        return False
+
+    if not is_active:
+        await message.reply_text("❌ Срок аукциона вышел")
+        return True
+
+    if end_time_str:
+        try:
+            end_time = datetime.fromisoformat(end_time_str)
+            if datetime.now() > end_time:
+                with DB:
+                    DB.execute("UPDATE auctions SET is_active = 0 WHERE channel_id = ? AND post_id = ?",
+                               (channel_id, post_id))
+                await update_auction_post(context, channel_id, post_id)
+                await message.reply_text("❌ Срок аукциона вышел")
+                return True
+        except ValueError:
+            pass
+
+    if current_bid is None:
+        min_required = start_price
+    else:
+        min_required = current_bid + min_step
+
+    if bid < min_required:
+        await message.reply_text(f"❌ Минимальная ставка: {min_required}₽")
+        return True
+
+    with DB:
+        DB.execute("""
+            UPDATE auctions
+            SET current_bid = ?, current_bidder_id = ?, current_bidder_label = ?
+            WHERE channel_id = ? AND post_id = ?
+        """, (bid, user.id, label, channel_id, post_id))
+
+    await message.reply_text(f"✅ Ставка {bid}₽ принята")
+    await update_auction_post(context, channel_id, post_id)
+    return True
+
+async def finalize_auction(context, channel_id, post_id):
+    row = DB.execute("SELECT is_active FROM auctions WHERE channel_id = ? AND post_id = ?",
+                     (channel_id, post_id)).fetchone()
+    if not row or not row[0]:
+        return
+
+    with DB:
+        DB.execute("UPDATE auctions SET is_active = 0 WHERE channel_id = ? AND post_id = ?",
+                   (channel_id, post_id))
+
+    logger.info("Аукцион %s/%s завершен", channel_id, post_id)
+    await update_auction_post(context, channel_id, post_id)
+
+async def check_expired_auctions(context):
+    """Ленивая проверка истекших аукционов."""
+    now = datetime.now().isoformat()
+    expired = DB.execute("""
+        SELECT channel_id, post_id FROM auctions
+        WHERE is_active = 1 AND end_time IS NOT NULL AND end_time <= ?
+    """, (now,)).fetchall()
+
+    for channel_id, post_id in expired:
+        try:
+            await finalize_auction(context, channel_id, post_id)
+        except Exception as e:
+            logger.exception("Ошибка завершения аукциона: %s", e)
+
+async def stop_auction_cmd(update, context):
+    message = update.effective_message
+    if not message:
+        return
+    username = (message.from_user.username or "").lower()
+    if username not in CANCEL_USERS:
+        await message.reply_text("❌ Нет прав")
+        return
+
+    reply = message.reply_to_message
+    if not reply or not reply.is_automatic_forward:
+        await message.reply_text("❌ Ответьте на пост аукциона")
+        return
+
+    origin = reply.forward_origin
+    if not isinstance(origin, MessageOriginChannel):
+        await message.reply_text("❌ Ответьте на пост аукциона")
+        return
+
+    with DB:
+        DB.execute("UPDATE auctions SET is_active = 0 WHERE channel_id = ? AND post_id = ?",
+                   (origin.chat.id, origin.message_id))
+
+    await update_auction_post(context, origin.chat.id, origin.message_id)
+    await message.reply_text("✅ Аукцион остановлен")
+
+async def start_auction_cmd(update, context):
+    message = update.effective_message
+    if not message:
+        return
+    username = (message.from_user.username or "").lower()
+    if username not in CANCEL_USERS:
+        await message.reply_text("❌ Нет прав")
+        return
+
+    reply = message.reply_to_message
+    if not reply or not reply.is_automatic_forward:
+        await message.reply_text("❌ Ответьте на пост аукциона")
+        return
+
+    origin = reply.forward_origin
+    if not isinstance(origin, MessageOriginChannel):
+        await message.reply_text("❌ Ответьте на пост аукциона")
+        return
+
+    auction = DB.execute("SELECT duration_minutes FROM auctions WHERE channel_id = ? AND post_id = ?",
+                         (origin.chat.id, origin.message_id)).fetchone()
+    if not auction:
+        await message.reply_text("❌ Аукцион не найден")
+        return
+
+    duration_minutes = auction[0]
+    new_end = datetime.now() + timedelta(minutes=duration_minutes)
+
+    with DB:
+        DB.execute("UPDATE auctions SET is_active = 1, end_time = ? WHERE channel_id = ? AND post_id = ?",
+                   (new_end.isoformat(), origin.chat.id, origin.message_id))
+
+    await update_auction_post(context, origin.chat.id, origin.message_id)
+    await message.reply_text(f"✅ Аукцион возобновлён до {new_end.strftime('%H:%M')}")
+
+# =====================================================
 # ADMIN COMMANDS: ADD TICKETS
 # =====================================================
 async def add_ticket_cmd(update, context):
-    """Команда /add для админов: вписать номерки за пользователя."""
+    """Команда /add для админов."""
     message = update.effective_message
     if not message:
         return
@@ -665,62 +1010,80 @@ async def add_ticket_cmd(update, context):
         await message.reply_text("❌ У вас нет прав для этой команды")
         return
 
-    args = context.args
-    if len(args) < 2:
-        await message.reply_text(
-            "❌ Использование:\n"
-            "/add <номерки> @username [мини]\n"
-            "Примеры:\n"
-            "/add 5 @user\n"
-            "/add рд @user мини\n"
-            "/add 1, 3 @user мини"
-        )
-        return
+    # Режим 1: через reply на сообщение пользователя
+    reply = message.reply_to_message
+    if reply and reply.from_user:
+        target_user = reply.from_user
+        target_user_id = target_user.id
+        target_label = user_label(target_user)
+        save_user(target_user)
 
-    target_user_str = args[-1]
-    is_mini = False
-    
-    if target_user_str.lower() == "мини":
-        if len(args) < 3:
-            await message.reply_text("❌ Не указан пользователь")
+        args = context.args
+        if not args:
+            await message.reply_text("❌ Укажите номерки. Пример: /add 5 или /add рд мини")
             return
-        is_mini = True
-        target_user_str = args[-2]
-        numbers_str = " ".join(args[:-2])
-    else:
-        numbers_str = " ".join(args[:-1])
 
-    if not target_user_str.startswith("@"):
-        await message.reply_text("❌ Укажите пользователя через @username")
-        return
-    
-    user_info = find_user_by_username(target_user_str)
-    if not user_info:
-        await message.reply_text(
-            f"❌ Пользователь {target_user_str} не найден.\n"
-            "Он должен хотя бы раз написать в чат, чтобы бот его запомнил."
-        )
-        return
-    
-    target_user_id = user_info[0]
-    target_username = user_info[1]
-    target_full_name = user_info[2]
-    target_label = f"@{target_username}" if target_username else target_full_name
+        is_mini = False
+        if args[-1].lower() == "мини":
+            is_mini = True
+            numbers_str = " ".join(args[:-1])
+        else:
+            numbers_str = " ".join(args)
+    else:
+        # Режим 2: по username
+        args = context.args
+        if len(args) < 2:
+            await message.reply_text(
+                "❌ Использование:\n"
+                "1. Ответьте на сообщение: /add 5 [мини]\n"
+                "2. По username: /add 5 @user [мини]"
+            )
+            return
+
+        target_user_str = args[-1]
+        is_mini = False
+
+        if target_user_str.lower() == "мини":
+            if len(args) < 3:
+                await message.reply_text("❌ Не указан пользователь")
+                return
+            is_mini = True
+            target_user_str = args[-2]
+            numbers_str = " ".join(args[:-2])
+        else:
+            numbers_str = " ".join(args[:-1])
+
+        if not target_user_str.startswith("@"):
+            await message.reply_text("❌ Укажите @username или ответьте на сообщение")
+            return
+
+        user_info = find_user_by_username(target_user_str)
+        if not user_info:
+            await message.reply_text(
+                f"❌ Пользователь {target_user_str} не найден.\n"
+                "Попросите его написать в чат, или ответьте на его сообщение."
+            )
+            return
+
+        target_user_id = user_info[0]
+        target_username = user_info[1]
+        target_full_name = user_info[2]
+        target_label = f"@{target_username}" if target_username else target_full_name
 
     lot = find_lottery_for_message(message)
     if not lot:
         await message.reply_text("❌ Не найдена активная лотерея в этом треде")
         return
-    
-    channel_id, post_id, lot_number, lot_count, _, _, _ = lot
+
+    channel_id, post_id, lot_number, lot_count, list_msg_id, _, _ = lot
 
     if "рд" in numbers_str.lower() or "рандом" in numbers_str.lower():
         match = re.search(r"(\d+)", numbers_str)
         if not match:
-            await message.reply_text("❌ Укажите количество рандомных номерков, например: /add 3 рд @user")
+            await message.reply_text("❌ Укажите количество: /add 3 рд @user")
             return
         count = int(match.group(1))
-        
+
         assigned = []
         for _ in range(count):
             free = DB.execute("""
@@ -731,19 +1094,23 @@ async def add_ticket_cmd(update, context):
                 break
             number = random.choice([r[0] for r in free])
             DB.execute("""
-                UPDATE lot_tickets 
+                UPDATE lot_tickets
                 SET owner_user_id = ?, owner_label = ?, is_mini = ?
                 WHERE channel_id = ? AND post_id = ? AND number = ?
-            """, (target_user_id, target_label, 1 if is_mini else 0, channel_id, post_id, number))
+            """, (target_user_id, target_label, 1 if is_mini else 0,
+                  channel_id, post_id, number))
             assigned.append(number)
-        
+
         if assigned:
             mini_text = " (мини)" if is_mini else ""
-            await message.reply_text(f"✅ Выданы рандомные номерки{mini_text}: {', '.join(map(str, assigned))} для {target_label}")
-            await refresh_lottery_list(context, message.chat.id, lot[4], channel_id, post_id, lot_number)
+            await message.reply_text(
+                f"✅ Выданы рандомные номерки{mini_text}: "
+                f"{', '.join(map(str, assigned))} для {target_label}"
+            )
+            await refresh_lottery_list(context, message.chat.id, list_msg_id,
+                                       channel_id, post_id, lot_number)
         else:
             await message.reply_text("❌ Нет свободных номерков")
-
     else:
         numbers = list(dict.fromkeys(int(v) for v in re.findall(r"\d+", numbers_str)))
         if not numbers:
@@ -760,105 +1127,32 @@ async def add_ticket_cmd(update, context):
         with DB:
             for number in numbers:
                 cursor = DB.execute("""
-                    UPDATE lot_tickets 
+                    UPDATE lot_tickets
                     SET owner_user_id = ?, owner_label = ?, is_mini = ?
                     WHERE channel_id = ? AND post_id = ? AND number = ? AND owner_user_id IS NULL
-                """, (target_user_id, target_label, 1 if is_mini else 0, channel_id, post_id, number))
+                """, (target_user_id, target_label, 1 if is_mini else 0,
+                      channel_id, post_id, number))
                 if cursor.rowcount == 1:
                     assigned.append(number)
                 else:
                     unavailable.append(number)
-        
+
         resp = []
         if assigned:
             mini_text = " (мини)" if is_mini else ""
             resp.append(f"✅ Выданы номерки{mini_text}: {', '.join(map(str, assigned))} для {target_label}")
         if unavailable:
             resp.append(f"⚠️ Заняты: {', '.join(map(str, unavailable))}")
-        
+
         if resp:
             await message.reply_text("\n".join(resp))
-            await refresh_lottery_list(context, message.chat.id, lot[4], channel_id, post_id, lot_number)
+            await refresh_lottery_list(context, message.chat.id, list_msg_id,
+                                       channel_id, post_id, lot_number)
 
 # =====================================================
 # PAYMENT & RESULTS
 # =====================================================
 async def oplata_cmd(update, context):
-    """Команда /oplata — считает оплату (только для админов)."""
-    message = update.effective_message
-    if not message:
-        return
-
-    username = (message.from_user.username or "").lower()
-    if username not in CANCEL_USERS:
-        await message.reply_text("❌ У вас нет прав для этой команды")
-        return
-
-    thread_id = message.message_thread_id
-    if not thread_id:
-        await message.reply_text("❌ Команда работает только в комментариях к посту лотереи")
-        return
-
-    lot = DB.execute("""
-        SELECT channel_id, post_id, lot_number, ticket_price, lottery_hashtag
-        FROM lots WHERE discussion_chat_id = ? AND thread_id = ?
-    """, (message.chat.id, thread_id)).fetchone()
-
-    if not lot:
-        await message.reply_text("❌ Лотерея не найдена")
-        return
-
-    channel_id, post_id, lot_number, ticket_price, lottery_hashtag = lot
-
-    if ticket_price <= 0:
-        await message.reply_text("❌ Цена номерка не указана в посте лотереи.")
-        return
-
-    # Определяем тип лотереи
-    is_mini_lottery = "мини" in lottery_hashtag.lower()
-    
-    # Для мини-лотерей учитываем ВСЕ номерки, для обычных — только без "мини"
-    if is_mini_lottery:
-        tickets = DB.execute("""
-            SELECT owner_user_id, owner_label, number FROM lot_tickets
-            WHERE channel_id = ? AND post_id = ? AND owner_user_id IS NOT NULL
-            ORDER BY number
-        """, (channel_id, post_id)).fetchall()
-    else:
-        tickets = DB.execute("""
-            SELECT owner_user_id, owner_label, number FROM lot_tickets
-            WHERE channel_id = ? AND post_id = ? AND owner_user_id IS NOT NULL AND is_mini = 0
-            ORDER BY number
-        """, (channel_id, post_id)).fetchall()
-
-    if not tickets:
-        await message.reply_text("❌ Пока нет записавшихся участников")
-        return
-
-    user_data = {}
-    for user_id, label, number in tickets:
-        if user_id not in user_data:
-            user_data[user_id] = {'label': label, 'numbers': []}
-        user_data[user_id]['numbers'].append(number)
-
-    lines = [f"💰 Оплата за лотерею #{lot_number}:", ""]
-    total_sum = 0
-
-    for user_id, data in user_data.items():
-        label = data['label']
-        count = len(data['numbers'])
-        amount = ticket_price * count
-        total_sum += amount
-        nums_str = ", ".join(map(str, data['numbers']))
-        lines.append(f"{label} — {ticket_price}₽ × {count} = {amount}₽ ({nums_str})")
-
-    lines.append("")
-    lines.append(f"<b>Итого: {total_sum}₽</b>")
-
-    await message.reply_text("\n".join(lines), parse_mode="HTML")
-
-async def oplata_post_cmd(update, context, bank_info):
-    """Генерирует пост оплаты для канала."""
     message = update.effective_message
     if not message:
         return
@@ -888,10 +1182,78 @@ async def oplata_post_cmd(update, context, bank_info):
         await message.reply_text("❌ Цена номерка не указана.")
         return
 
-    # Определяем тип лотереи
-    is_mini_lottery = "мини" in lottery_hashtag.lower()
-    
-    # Для мини-лотерей учитываем ВСЕ номерки, для обычных — только без "мини"
+    is_mini_lottery = "мини" in (lottery_hashtag or "").lower()
+
+    if is_mini_lottery:
+        tickets = DB.execute("""
+            SELECT owner_user_id, owner_label, number FROM lot_tickets
+            WHERE channel_id = ? AND post_id = ? AND owner_user_id IS NOT NULL
+            ORDER BY number
+        """, (channel_id, post_id)).fetchall()
+    else:
+        tickets = DB.execute("""
+            SELECT owner_user_id, owner_label, number FROM lot_tickets
+            WHERE channel_id = ? AND post_id = ? AND owner_user_id IS NOT NULL AND is_mini = 0
+            ORDER BY number
+        """, (channel_id, post_id)).fetchall()
+
+    if not tickets:
+        await message.reply_text("❌ Пока нет записавшихся участников")
+        return
+
+    user_data = {}
+    for user_id, label, number in tickets:
+        if label not in user_data:
+            user_data[label] = {'numbers': []}
+        user_data[label]['numbers'].append(number)
+
+    lines = [f"💰 Оплата за лотерею #{lot_number}:", ""]
+    total_sum = 0
+
+    for label, data in user_data.items():
+        count = len(data['numbers'])
+        amount = ticket_price * count
+        total_sum += amount
+        nums_str = ", ".join(map(str, data['numbers']))
+        lines.append(f"{label} — {ticket_price}₽ × {count} = {amount}₽ ({nums_str})")
+
+    lines.append("")
+    lines.append(f"<b>Итого: {total_sum}₽</b>")
+
+    await message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def oplata_post_cmd(update, context, bank_info):
+    message = update.effective_message
+    if not message:
+        return
+
+    username = (message.from_user.username or "").lower()
+    if username not in CANCEL_USERS:
+        await message.reply_text("❌ У вас нет прав для этой команды")
+        return
+
+    thread_id = message.message_thread_id
+    if not thread_id:
+        await message.reply_text("❌ Команда работает только в комментариях к посту лотереи")
+        return
+
+    lot = DB.execute("""
+        SELECT channel_id, post_id, lot_number, ticket_price, lottery_hashtag
+        FROM lots WHERE discussion_chat_id = ? AND thread_id = ?
+    """, (message.chat.id, thread_id)).fetchone()
+
+    if not lot:
+        await message.reply_text("❌ Лотерея не найдена")
+        return
+
+    channel_id, post_id, lot_number, ticket_price, lottery_hashtag = lot
+
+    if ticket_price <= 0:
+        await message.reply_text("❌ Цена номерка не указана.")
+        return
+
+    is_mini_lottery = "мини" in (lottery_hashtag or "").lower()
+
     if is_mini_lottery:
         tickets = DB.execute("""
             SELECT owner_user_id, owner_label, number FROM lot_tickets
@@ -911,14 +1273,13 @@ async def oplata_post_cmd(update, context, bank_info):
 
     user_data = {}
     for user_id, label, number in tickets:
-        if user_id not in user_data:
-            user_data[user_id] = {'label': label, 'numbers': []}
-        user_data[user_id]['numbers'].append(number)
+        if label not in user_data:
+            user_data[label] = {'numbers': []}
+        user_data[label]['numbers'].append(number)
 
     participants_list = []
     idx = 1
-    for user_id, data in user_data.items():
-        label = data['label']
+    for label, data in user_data.items():
         count = len(data['numbers'])
         amount = ticket_price * count
         nums_str = ", ".join(map(str, data['numbers']))
@@ -930,12 +1291,12 @@ async def oplata_post_cmd(update, context, bank_info):
     header = (
         "ღ꧁ღ╭⊱ꕥꕥ⊱╮ღ꧂ღ\n"
         "              ОПЛАТА\n"
-        "»»————— ★ —————««\n\n"
+        "»»——— ★ ———««\n\n"
         "Перед оплатой не забудьте проверить номерки.\n"
         " ★ - оплачено\n\n"
         f"{bank_info}\n\n"
     )
-    
+
     footer = (
         "\n‣ скрин о переводе в комментарии с указанием номера и юза\n"
         "‣ дедлайн: 12 часов\n\n"
@@ -958,7 +1319,6 @@ async def oplata_tih_cmd(update, context):
     await oplata_post_cmd(update, context, "89673136733 Тихомир У. (Озон банк)")
 
 async def result_cmd(update, context):
-    """Команда /result — выбирает победителя и публикует пост в канал."""
     message = update.effective_message
     if not message:
         return
@@ -997,6 +1357,10 @@ async def result_cmd(update, context):
     winning_number = winning_ticket[0]
     winner_label = winning_ticket[1]
 
+    # Для старых лотерей, где lottery_hashtag пустой
+    if not lottery_hashtag:
+        lottery_hashtag = f"#лот_{lot_number}"
+
     result_text = (
         f"<b>РЕЗУЛЬТАТЫ.</b>\n\n"
         f"Победил номерок: <b>{winning_number}</b> — {winner_label}. "
@@ -1016,9 +1380,20 @@ async def result_cmd(update, context):
 # ALL COMMENTS
 # =====================================================
 async def handle_all_comments(update, context):
+    # Ленивая проверка истекших аукционов
+    await check_expired_auctions(context)
+
+    # 1. Сначала аукцион
+    handled = await handle_auction_comment(update, context)
+    if handled:
+        return
+
+    # 2. Потом лотерея
     handled = await handle_lottery_comment(update, context)
     if handled:
         return
+
+    # 3. Иначе — шоп
     await handle_shop_comment(update, context)
 
 # =====================================================
@@ -1032,6 +1407,20 @@ async def handle_edited_channel_post(update, context):
     channel_id = message.chat.id
     post_id = message.message_id
     text = get_caption(message)
+
+    # Если это пост аукциона — обновляем
+    auction = DB.execute("""
+        SELECT 1 FROM auctions WHERE channel_id = ? AND post_id = ?
+    """, (channel_id, post_id)).fetchone()
+
+    if auction:
+        with DB:
+            DB.execute("""
+                UPDATE auctions SET base_caption = ?
+                WHERE channel_id = ? AND post_id = ?
+            """, (text, channel_id, post_id))
+        await update_auction_post(context, channel_id, post_id)
+        return
 
     positions = extract_positions(text)
     if not positions:
@@ -1076,14 +1465,15 @@ async def start(update, context):
             "Привет! Я бот магазина PABO SHOP 🎟️\n\n"
             "Разбор: напиши номер позиции, например 6 или 6, 7.\n"
             "Лотерея: напиши любой номер или рд, например 1 или 3 рд.\n"
-            "Случайные номерки: «3 рд» выдаёт три случайных номерка.\n"
-            "Отмена номерков доступна только админам шопа.\n\n"
+            "Аукцион: напиши ставку в рублях, например 250₽\n\n"
             "Команды для админов:\n"
             "/add <номерки> @user [мини] — вписать номерки\n"
-            "/oplata — посчитать оплату (в чат)\n"
+            "/oplata — посчитать оплату\n"
             "/oplata_kar — пост оплаты для Кари\n"
             "/oplata_tih — пост оплаты для Тихомира\n"
-            "/result — выбрать победителя"
+            "/result — выбрать победителя\n"
+            "/stop_ayk — остановить аукцион\n"
+            "/start_ayk — возобновить аукцион"
         )
 
 async def ping(update, context):
@@ -1095,7 +1485,7 @@ async def ping(update, context):
 # =====================================================
 def main():
     if not TOKEN:
-        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN. Установи токен в переменную окружения.")
+        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN.")
 
     init_db()
 
@@ -1103,12 +1493,13 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
-    
     app.add_handler(CommandHandler("add", add_ticket_cmd))
     app.add_handler(CommandHandler("oplata", oplata_cmd))
     app.add_handler(CommandHandler("oplata_kar", oplata_kar_cmd))
     app.add_handler(CommandHandler("oplata_tih", oplata_tih_cmd))
     app.add_handler(CommandHandler("result", result_cmd))
+    app.add_handler(CommandHandler("stop_ayk", stop_auction_cmd))
+    app.add_handler(CommandHandler("start_ayk", start_auction_cmd))
 
     app.add_handler(MessageHandler(filters.ALL, handle_root_post), group=-1)
     app.add_handler(
